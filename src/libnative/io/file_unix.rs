@@ -17,6 +17,7 @@ use std::io;
 use std::libc::{c_int, c_void};
 use std::libc;
 use std::mem;
+use std::os;
 use std::rt::rtio;
 use std::slice;
 
@@ -54,9 +55,11 @@ impl FileDesc {
     //               rtio traits in scope
     pub fn inner_read(&mut self, buf: &mut [u8]) -> Result<uint, IoError> {
         let ret = retry(|| unsafe {
-            libc::read(self.fd(),
-                       buf.as_mut_ptr() as *mut libc::c_void,
-                       buf.len() as libc::size_t) as libc::c_int
+            blocking(self.fd(), |fd| {
+                libc::read(fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len() as libc::size_t) as i64
+            }) as libc::c_int
         });
         if ret == 0 {
             Err(io::standard_error(io::EndOfFile))
@@ -69,8 +72,10 @@ impl FileDesc {
     pub fn inner_write(&mut self, buf: &[u8]) -> Result<(), IoError> {
         let ret = keep_going(buf, |buf, len| {
             unsafe {
-                libc::write(self.fd(), buf as *libc::c_void,
-                            len as libc::size_t) as i64
+                blocking(self.fd(), |fd| {
+                    libc::write(fd, buf as *libc::c_void,
+                                len as libc::size_t) as i64
+                })
             }
         });
         if ret < 0 {
@@ -84,6 +89,25 @@ impl FileDesc {
         // This unsafety is fine because we're just reading off the file
         // descriptor, no one is modifying this.
         unsafe { (*self.inner.get()).fd }
+    }
+}
+
+unsafe fn blocking(fd: fd_t, f: |fd_t| -> i64) -> i64 {
+    loop {
+        match f(fd) {
+            -1 => {
+                let e = os::errno() as int;
+                if e == libc::EAGAIN as int || e == libc::EWOULDBLOCK as int {
+                    let mut flags = libc::fcntl(fd, 3 /* F_GETFL */);
+                    if flags == -1 { return -1 }
+                    flags &= !0x0004 /* O_NONBLOCK */;
+                    if libc::fcntl(fd, 4 /* F_SETFL */, flags) == -1 { return -1 }
+                } else {
+                    return -1
+                }
+            }
+            n => return n
+        }
     }
 }
 
